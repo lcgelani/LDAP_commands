@@ -1,0 +1,224 @@
+step 1.
+```````
+#install ldap packages
+yum install -y openldap-servers openldap-clients
+step 2.
+```````
+#copy DB_CONFIG file to /var/lib/ldap and change ownership then start services
+cp /usr/share/openldap-servers/DB_CONFIG.example /var/lib/ldap/DB_CONFIG
+chown ldap. /var/lib/ldap/DB_CONFIG
+systemctl start slapd
+systemctl enable slapd
+step 3.
+```````
+#create ldap password and save to a file
+slappasswd > Documents/key.txt
+step 4.
+```````
+#create chrootpw.ldif file and write that created password
+vim chrootpw.ldif	
+	# specify the password generated above for "olcRootPW" section
+	dn: olcDatabase={0}config,cn=config
+	changetype: modify
+	add: olcRootPW
+	olcRootPW: {SSHA}xxxxxxxxxxxxxxxxxxxxxxxx
+#add file to ldap
+ldapadd -Y EXTERNAL -H ldapi:/// -f chrootpw.ldif
+step 5.
+```````
+#import basic schemas.
+ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/cosine.ldif
+ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/nis.ldif
+ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/inetorgperson.ldif
+step 6.
+```````
+#Set your domain name on LDAP DB.
+# generate directory manager's password
+slappasswd > Documents/manager_key.txt
+step 7.
+```````
+##create chdomain.ldif file and write that created password
+vim chdomain.ldif
+	#replace to your own domain name for "dc=***,dc=***" section
+	# specify the password generated above for "olcRootPW" section
+	dn: olcDatabase={1}monitor,cn=config
+	changetype: modify
+	replace: olcAccess
+	olcAccess: {0}to * by dn.base="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth"
+  		read by dn.base="cn=Manager,dc=red,dc=moon" read by * none
+
+	dn: olcDatabase={2}hdb,cn=config
+	changetype: modify
+	replace: olcSuffix
+	olcSuffix: dc=red,dc=moon
+
+	dn: olcDatabase={2}hdb,cn=config
+	changetype: modify
+	replace: olcRootDN
+	olcRootDN: cn=Manager,dc=red,dc=moon
+
+	dn: olcDatabase={2}hdb,cn=config
+	changetype: modify
+	add: olcRootPW
+	olcRootPW: {SSHA}xxxxxxxxxxxxxxxxxxxxxxxx
+
+	dn: olcDatabase={2}hdb,cn=config
+	changetype: modify
+	add: olcAccess
+	olcAccess: {0}to attrs=userPassword,shadowLastChange by
+  	dn="cn=Manager,dc=red,dc=moon" write by anonymous auth by self write by * none
+	olcAccess: {1}to dn.base="" by * read
+	olcAccess: {2}to * by dn="cn=Manager,dc=red,dc=moon" write by * read
+
+#add file to ldap	
+ldapmodify -Y EXTERNAL -H ldapi:/// -f chdomain.ldif
+step 8.
+```````
+vim basedomain.ldif
+	#replace to your own domain name for "dc=***,dc=***" section
+	dn: dc=red,dc=moon
+	objectClass: top
+	objectClass: dcObject
+	objectclass: organization
+	o: galaxy
+	dc: red
+
+	dn: cn=Manager,dc=red,dc=moon
+	objectClass: organizationalRole
+	cn: Manager
+	description: Directory Manager
+
+	dn: ou=People,dc=red,dc=moon
+	objectClass: organizationalUnit
+	ou: People
+
+	dn: ou=Group,dc=red,dc=moon
+	objectClass: organizationalUnit
+	ou: Group
+
+#add file to ldap
+ldapadd -x -D cn=Manager,dc=red,dc=moon -W -f basedomain.ldif
+
+step 9.
+```````
+#add users
+vim ldapuser.ldif
+	#create new
+	# replace to your own domain name for "dc=***,dc=***" section
+	dn: uid=cent,ou=People,dc=red,dc=moon
+	objectClass: inetOrgPerson
+	objectClass: posixAccount
+	objectClass: shadowAccount
+	cn: Cent
+	sn: Linux
+	userPassword: {SSHA}xxxxxxxxxxxxxxxxx
+	loginShell: /bin/bash
+	uidNumber: 1008    #changable
+	gidNumber: 1008	 #changable
+	homeDirectory: /home/cent
+
+	dn: cn=cent,ou=Group,dc=red,dc=moon
+	objectClass: posixGroup
+	cn: Cent
+	gidNumber: 1008    #changable
+	memberUid: cent
+
+ldapadd -x -D cn=Manager,dc=srv,dc=world -W -f ldapuser.ldif
+
+step 10. (optional)
+````````
+#Add users and groups in local passwd/group to LDAP directory.
+vim ldapuser.sh
+	# extract local users and groups who have 1000-9999 digit UID
+	# replace "SUFFIX=***" to your own domain name
+	# this is an example
+	#!/bin/bash
+
+	SUFFIX='dc=red,dc=moon'
+	LDIF='ldapuser.ldif'
+
+	echo -n > $LDIF
+	GROUP_IDS=()
+	grep "x:[1-9][0-9][0-9][0-9]:" /etc/passwd | (while read TARGET_USER
+	do
+    		USER_ID="$(echo "$TARGET_USER" | cut -d':' -f1)"
+
+	    	USER_NAME="$(echo "$TARGET_USER" | cut -d':' -f5 | cut -d' ' -f1,2)"
+    		[ ! "$USER_NAME" ] && USER_NAME="$USER_ID"
+
+    		LDAP_SN="$(echo "$USER_NAME" | cut -d' ' -f2)"
+    		[ ! "$LDAP_SN" ] && LDAP_SN="$USER_NAME"
+
+    		LASTCHANGE_FLAG="$(grep "${USER_ID}:" /etc/shadow | cut -d':' -f3)"
+    		[ ! "$LASTCHANGE_FLAG" ] && LASTCHANGE_FLAG="0"
+
+	    	SHADOW_FLAG="$(grep "${USER_ID}:" /etc/shadow | cut -d':' -f9)"
+    		[ ! "$SHADOW_FLAG" ] && SHADOW_FLAG="0"
+
+    		GROUP_ID="$(echo "$TARGET_USER" | cut -d':' -f4)"
+    		[ ! "$(echo "${GROUP_IDS[@]}" | grep "$GROUP_ID")" ] && GROUP_IDS=("${GROUP_IDS[@]}" "$GROUP_ID")
+
+    		echo "dn: uid=$USER_ID,ou=People,$SUFFIX" >> $LDIF
+    		echo "objectClass: inetOrgPerson" >> $LDIF
+    		echo "objectClass: posixAccount" >> $LDIF
+    		echo "objectClass: shadowAccount" >> $LDIF
+    		echo "sn: $LDAP_SN" >> $LDIF
+    		echo "givenName: $(echo "$USER_NAME" | awk '{print $1}')" >> $LDIF
+    		echo "cn: $USER_NAME" >> $LDIF
+    		echo "displayName: $USER_NAME" >> $LDIF
+    		echo "uidNumber: $(echo "$TARGET_USER" | cut -d':' -f3)" >> $LDIF
+    		echo "gidNumber: $(echo "$TARGET_USER" | cut -d':' -f4)" >> $LDIF
+    		echo "userPassword: {crypt}$(grep "${USER_ID}:" /etc/shadow | cut -d':' -f2)" >> $LDIF
+    		echo "gecos: $USER_NAME" >> $LDIF
+    		echo "loginShell: $(echo "$TARGET_USER" | cut -d':' -f7)" >> $LDIF
+    		echo "homeDirectory: $(echo "$TARGET_USER" | cut -d':' -f6)" >> $LDIF
+    		echo "shadowExpire: $(passwd -S "$USER_ID" | awk '{print $7}')" >> $LDIF
+    		echo "shadowFlag: $SHADOW_FLAG" >> $LDIF
+    		echo "shadowWarning: $(passwd -S "$USER_ID" | awk '{print $6}')" >> $LDIF
+    		echo "shadowMin: $(passwd -S "$USER_ID" | awk '{print $4}')" >> $LDIF
+    		echo "shadowMax: $(passwd -S "$USER_ID" | awk '{print $5}')" >> $LDIF
+    		echo "shadowLastChange: $LASTCHANGE_FLAG" >> $LDIF
+    		echo >> $LDIF
+	done
+
+	for TARGET_GROUP_ID in "${GROUP_IDS[@]}"
+	do
+    		LDAP_CN="$(grep ":${TARGET_GROUP_ID}:" /etc/group | cut -d':' -f1)"
+
+    		echo "dn: cn=$LDAP_CN,ou=Group,$SUFFIX" >> $LDIF
+    		echo "objectClass: posixGroup" >> $LDIF
+    		echo "cn: $LDAP_CN" >> $LDIF
+    		echo "gidNumber: $TARGET_GROUP_ID" >> $LDIF
+
+    		for MEMBER_UID in $(grep ":${TARGET_GROUP_ID}:" /etc/passwd | cut -d':' -f1,3)
+    		do
+        		UID_NUM=$(echo "$MEMBER_UID" | cut -d':' -f2)
+        		[ $UID_NUM -ge 1000 -a $UID_NUM -le 9999 ] && echo "memberUid: $(echo "$MEMBER_UID" | cut -d':' -f1)" >> $LDIF
+    		done
+    		echo >> $LDIF
+	done
+	)
+#excute bash script
+sh ldapuser.sh
+
+#add to ldap
+ldapadd -x -D cn=Manager,dc=red,dc=moon -W -f ldapuser.ldif
+
+
+step 11.
+````````
+#for deleting LDAP user
+ldapdelete -x -W -D 'cn=Manager,dc=red,dc=moon' "uid=cent,ou=People,dc=red,dc=moon"
+
+ldapdelete -x -W -D 'cn=Manager,dc=red,dc=moon' "cn=cent,ou=Group,dc=red,dc=moon"
+
+step 12.
+````````
+yum install -y openldap-clients nss-pam-ldap
+authconfig --enableldap --enableldapauth --ldapserver=dlp.red.moon --ldapbasedn="dc=red,dc=moon" --enablemkhomedir --update
+systemctl restart nslcd
+
+
+reset password
+```````````````
+ldappasswd -S [passwd] -W -D "cn=ldapadm, dc=red,dc=moon" -x "uid=[id], ou=people, dc=red, dc=moon"
